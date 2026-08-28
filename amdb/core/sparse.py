@@ -35,8 +35,14 @@ class COOCube:
     shape: tuple[int, ...]
 
     def __post_init__(self) -> None:
-        self.coords = np.asarray(self.coords, dtype=np.int64).reshape(-1, len(self.axes))
         self.values = np.asarray(self.values).reshape(-1)
+        coords = np.asarray(self.coords, dtype=np.int64)
+        if len(self.axes):
+            self.coords = coords.reshape(-1, len(self.axes))
+        else:
+            # Куб ранга 0 — скаляр: координат нет вовсе. reshape(-1, 0) вывести
+            # число строк не может, поэтому оно берётся из значений.
+            self.coords = coords.reshape(self.values.shape[0], 0)
         self.axes = tuple(self.axes)
         self.shape = tuple(int(s) for s in self.shape)
         if self.coords.shape[0] != self.values.shape[0]:
@@ -74,7 +80,7 @@ class COOCube:
     def to_dense(self) -> MultidimensionalMatrix:
         out = np.zeros(self.shape, dtype=self.values.dtype)
         if self.nnz:
-            flat = np.ravel_multi_index(tuple(self.coords.T), self.shape)
+            flat = _key(self.coords, self.shape)
             np.add.at(out.reshape(-1), flat, self.values)
         return MultidimensionalMatrix(out, self.axes)
 
@@ -83,14 +89,18 @@ class COOCube:
         """Складывает дубликаты координат и отбрасывает нули."""
         if not self.nnz:
             return self
-        flat = np.ravel_multi_index(tuple(self.coords.T), self.shape)
+        flat = _key(self.coords, self.shape)
         order = np.argsort(flat, kind="stable")
         flat, vals = flat[order], self.values[order]
         uniq, start = np.unique(flat, return_index=True)
         summed = np.add.reduceat(vals, start)
         keep = summed != 0
         uniq, summed = uniq[keep], summed[keep]
-        coords = np.stack(np.unravel_index(uniq, self.shape), axis=1)
+        if self.rank:
+            coords = np.stack(np.unravel_index(uniq, self.shape), axis=1)
+        else:
+            # Скаляр: все слагаемые попадают в единственную ячейку.
+            coords = np.zeros((uniq.size, 0), dtype=np.int64)
         return COOCube(coords, summed, self.axes, self.shape)
 
     def project(self, drop: Iterable[str]) -> "COOCube":

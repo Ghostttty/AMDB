@@ -351,3 +351,31 @@ def test_avg_of_a_squared_measure_does_not_double_count_the_denominator():
     # Ячейка содержит сумму 6 при двух строках: AVG(q*q) = 36 / 2 = 18.
     rows = db.sql("SELECT a, AVG(f.q * f.q) AS v FROM f GROUP BY a").rows
     assert rows[0][1] == pytest.approx(18.0)
+
+
+@pytest.mark.parametrize("layout", ["dense", "sparse_coo"])
+def test_scalar_aggregate_without_group_by_on_both_layouts(layout):
+    """Регрессия: SUM без GROUP BY падал на разреженном кубе.
+
+    Оба представления обязаны давать один и тот же ответ: выбор представления
+    есть решение о хранении, а не о семантике.
+    """
+    pd = pytest.importorskip("pandas")
+    from amdb import Database
+
+    rng = np.random.default_rng(0)
+    n = 4000
+    frame = pd.DataFrame({"customer": rng.integers(0, 80, n),
+                          "product": rng.integers(0, 80, n),
+                          "date": rng.integers(0, 80, n),
+                          "quantity": rng.random(n)})
+    db = Database()
+    db.load_frame(frame, ["customer", "product", "date"], "quantity", "sales",
+                  layout=layout)
+    assert db.cube("sales").is_sparse == (layout == "sparse_coo")
+
+    assert db.sql("SELECT SUM(quantity) AS q FROM sales").rows[0][0] == \
+        pytest.approx(float(frame.quantity.sum()))
+    assert db.sql("SELECT COUNT(*) AS n FROM sales").rows[0][0] == pytest.approx(n)
+    assert db.sql("SELECT AVG(quantity) AS a FROM sales").rows[0][0] == \
+        pytest.approx(float(frame.quantity.mean()))

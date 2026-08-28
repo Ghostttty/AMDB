@@ -26,6 +26,10 @@ classifiers = [
     "Topic :: Database :: Database Engines/Servers",
     "Topic :: Scientific/Engineering :: Mathematics",
 ]
+# Нижняя граница — та, при которой всё работает. Версии, на которых сняты
+# опубликованные замеры, закреплены отдельно в extras `pinned` (см. ниже):
+# производительность einsum заметно менялась между выпусками NumPy, поэтому
+# среда замера — часть самого замера, а не примечание к нему.
 dependencies = ["numpy>=1.24"]
 
 [project.optional-dependencies]
@@ -35,6 +39,19 @@ api = ["fastapi>=0.110", "uvicorn>=0.27", "pydantic>=2.0"]
 gpu = ["torch>=2.0"]
 sql = ["psycopg[binary]>=3.1", "clickhouse-driver>=0.2"]
 bench = ["pandas>=2.0", "duckdb>=0.10"]
+# Встраиваемый ClickHouse для стенда bench_clickhouse.py. Сборок под Windows
+# нет — см. раздел «Проверка в Linux» в README.
+clickhouse = ["chdb>=4.3"]
+# Точные версии, на которых сняты числа в статье и в bench/README.
+# Ставить так:  pip install -e ".[pinned]"
+pinned = [
+    "numpy==2.5.2",
+    "pandas==3.0.5",
+    "pyarrow==25.0.1",
+    "duckdb==1.5.5",
+    "chdb==4.3.0",
+    "pytest==9.1.1",
+]
 dev = [
     "pytest>=7.4",
     "pytest-cov>=4.1",

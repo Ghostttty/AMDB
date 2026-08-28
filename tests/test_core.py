@@ -262,3 +262,27 @@ def test_batched_matmul_agrees_with_naive_definition():
     A = rng.random((3, 4, 5))
     B = rng.random((4, 5, 3))
     assert np.allclose(convolve(A, B, lam=1, mu=1), convolve_naive(A, B, lam=1, mu=1))
+
+
+def test_sparse_cube_supports_rank_zero_projection():
+    """Проекция разреженного куба на скаляр не должна падать.
+
+    Проталкивание проекций (§3.2 статьи) сворачивает частные оси операнда
+    заранее. У скалярного агрегата без GROUP BY частными оказываются **все**
+    оси, и проекция даёт куб ранга 0. Массив координат при этом имеет форму
+    (nnz, 0), из которой число строк вывести нельзя, — на этом реализация и
+    ломалась, но только на разреженном пути и только без GROUP BY.
+    """
+    rng = np.random.default_rng(0)
+    dense = MultidimensionalMatrix((rng.random((6, 5, 4)) < 0.3) * rng.random((6, 5, 4)),
+                                   ("a", "b", "c"))
+    sparse = COOCube.from_dense(dense)
+
+    scalar = sparse.project({"a", "b", "c"})
+    assert scalar.rank == 0 and scalar.axes == ()
+    assert scalar.coords.shape == (scalar.nnz, 0)
+    assert float(scalar.to_dense().data) == pytest.approx(float(dense.data.sum()))
+
+    partial = sparse.project({"b"})
+    assert partial.axes == ("a", "c")
+    assert np.allclose(partial.to_dense().data, dense.data.sum(axis=1))

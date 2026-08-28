@@ -99,8 +99,8 @@ def main() -> int:
     print(f"  AMDB   — гиперкуб за {fmt_ms(t_amdb_load)} мс; "
           f"{stats['total_cells']:,} ячеек, заполнено {stats['fill_factor']:.2%}, "
           f"{total_mib:.1f} МиБ во всех кубах".replace(",", " "))
-    print(f"  DuckDB — регистрация таблиц за {fmt_ms(t_duck_load)} мс "
-          "(данные остаются сырыми)\n")
+    print(f"  DuckDB — таблицы за {fmt_ms(t_duck_load)} мс "
+          "(факты остаются сырыми строками)\n")
 
     # --- запросы ------------------------------------------------------------
     header = (f"{'запрос':<38}{'AMDB, мс':>11}{'DuckDB, мс':>12}"

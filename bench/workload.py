@@ -227,17 +227,33 @@ def build_amdb(work: Workload, **load_kwargs):
     return db
 
 
+def _materialize_tables(con, work: Workload) -> None:
+    """Переносит кадры данных в собственные таблицы DuckDB.
+
+    Регистрация кадра (``con.register``) оставляет данные в pandas, и DuckDB
+    читает их через интерфейс обмена при **каждом** запросе. Сравнение тогда
+    выходит несимметричным: одна система получает данные, единожды переведённые
+    в свой внутренний формат (гиперкуб), а другая платит за преобразование
+    каждый раз. Разница велика — на группировке по одному измерению вчетверо, —
+    поэтому данные переносятся в нативные таблицы, и обе системы сравниваются
+    на своих внутренних представлениях.
+    """
+    for name, frame in (("sales", work.sales), ("products", work.products),
+                        ("customers", work.customers), ("dates", work.dates)):
+        con.register(f"_src_{name}", frame)
+        con.execute(f"CREATE TABLE {name} AS SELECT * FROM _src_{name}")
+        con.unregister(f"_src_{name}")
+    con.execute("SELECT COUNT(*) FROM sales").fetchall()
+
+
 def build_duckdb(work: Workload, threads: int | None = None):
-    """Регистрирует те же данные в DuckDB."""
+    """Те же данные в DuckDB, в её собственных таблицах."""
     import duckdb
 
     con = duckdb.connect()
     if threads:
         con.execute(f"PRAGMA threads={threads}")
-    con.register("sales", work.sales)
-    con.register("products", work.products)
-    con.register("customers", work.customers)
-    con.register("dates", work.dates)
+    _materialize_tables(con, work)
     return con
 
 
@@ -260,9 +276,11 @@ def build_duckdb_materialized(work: Workload, threads: int | None = None):
     if threads:
         con.execute(f"PRAGMA threads={threads}")
     con.register("raw_sales", work.sales)
-    con.register("products", work.products)
-    con.register("customers", work.customers)
-    con.register("dates", work.dates)
+    for name, frame in (("products", work.products), ("customers", work.customers),
+                        ("dates", work.dates)):
+        con.register(f"_src_{name}", frame)
+        con.execute(f"CREATE TABLE {name} AS SELECT * FROM _src_{name}")
+        con.unregister(f"_src_{name}")
 
     t0 = time.perf_counter()
     con.execute("""
@@ -323,3 +341,118 @@ def normalize(rows, keys_count: int, digits: int = 6) -> list[tuple]:
         value = row[keys_count] if len(row) > keys_count else row[-1]
         out.append(key + (round(float(value), digits),))
     return sorted(out)
+
+
+# --- ClickHouse ------------------------------------------------------------
+#: Настройка чтения файлов: без неё столбцы приходят Nullable, что и запрещает
+#: их в ключе сортировки MergeTree, и замедляет обработку.
+NOT_NULL = "SETTINGS schema_inference_make_columns_nullable=0"
+
+
+def to_clickhouse(sql: str) -> str:
+    """Приводит запрос из диалекта DuckDB к диалекту ClickHouse.
+
+    Различие ровно одно и оно существенно: ``COUNT(DISTINCT x)`` в ClickHouse
+    отображается на приблизительный ``uniq``, тогда как сверка результатов
+    требует точного значения. Явный ``uniqExact`` даёт его.
+    """
+    return sql.replace("COUNT(DISTINCT ", "uniqExact(")
+
+
+def _load_clickhouse(session, work: Workload, sales_ddl: str, tmpdir: str) -> None:
+    """Переносит кадры данных в таблицы ClickHouse через Parquet."""
+    import os
+
+    for name, frame in (("sales", work.sales), ("products", work.products),
+                        ("customers", work.customers), ("dates", work.dates)):
+        path = os.path.join(tmpdir, f"{name}.parquet")
+        frame.to_parquet(path, index=False)
+        ddl = sales_ddl if name == "sales" else "ENGINE=Memory"
+        session.query(f"DROP TABLE IF EXISTS {name}")
+        session.query(f"CREATE TABLE {name} {ddl} AS "
+                      f"SELECT * FROM file('{path}', Parquet) {NOT_NULL}")
+    session.query("SELECT count() FROM sales", "CSV")
+
+
+def build_clickhouse(work: Workload, engine: str = "Memory", tmpdir: str | None = None):
+    """Те же данные в ClickHouse, в его собственных таблицах.
+
+    Используется chdb — встраиваемая сборка ClickHouse: она работает в том же
+    процессе, что и остальные измеряемые системы, поэтому в замер не попадают
+    ни сетевой обмен, ни клиент-серверные накладные расходы. Это то же условие,
+    на котором в стенд взята DuckDB.
+
+    ``engine`` — ``Memory`` (аналог таблиц DuckDB в памяти) либо ``MergeTree``
+    (рабочее представление ClickHouse, с ключом сортировки по измерениям куба).
+    """
+    import tempfile
+
+    from chdb import session as chs
+
+    if tmpdir is None:
+        tmpdir = tempfile.mkdtemp(prefix="amdb-ch-")
+    ddl = {"Memory": "ENGINE=Memory",
+           "MergeTree": "ENGINE=MergeTree ORDER BY (customer, product, date)"}[engine]
+    session = chs.Session()
+    _load_clickhouse(session, work, ddl, tmpdir)
+    return session
+
+
+def build_clickhouse_materialized(work: Workload, tmpdir: str | None = None):
+    """ClickHouse с материализованным агрегатом гранулярности гиперкуба.
+
+    Симметричный аналог гиперкуба, такой же, как ``build_duckdb_materialized``
+    для DuckDB: факт свёрнут до (customer, product, date) и снабжён счётчиком
+    строк. Возвращает (сессия, время построения в секундах).
+    """
+    import os
+    import tempfile
+    import time
+
+    from chdb import session as chs
+
+    if tmpdir is None:
+        tmpdir = tempfile.mkdtemp(prefix="amdb-ch-")
+    session = chs.Session()
+    raw = os.path.join(tmpdir, "raw_sales.parquet")
+    work.sales.to_parquet(raw, index=False)
+    session.query("DROP TABLE IF EXISTS raw_sales")
+    session.query(f"CREATE TABLE raw_sales ENGINE=Memory AS "
+                  f"SELECT * FROM file('{raw}', Parquet) {NOT_NULL}")
+    for name, frame in (("products", work.products), ("customers", work.customers),
+                        ("dates", work.dates)):
+        path = os.path.join(tmpdir, f"{name}.parquet")
+        frame.to_parquet(path, index=False)
+        session.query(f"DROP TABLE IF EXISTS {name}")
+        session.query(f"CREATE TABLE {name} ENGINE=Memory AS "
+                      f"SELECT * FROM file('{path}', Parquet) {NOT_NULL}")
+
+    t0 = time.perf_counter()
+    session.query("DROP TABLE IF EXISTS sales")
+    session.query("""
+        CREATE TABLE sales ENGINE = MergeTree ORDER BY (customer, product, date) AS
+        SELECT customer, product, date,
+               sum(quantity) AS quantity,
+               count()       AS n
+        FROM raw_sales GROUP BY customer, product, date
+    """)
+    session.query("SELECT count() FROM sales", "CSV")
+    return session, time.perf_counter() - t0
+
+
+def clickhouse_overhead(session, repeat: int = 9) -> float:
+    """Постоянные накладные расходы chdb на один запрос, в секундах.
+
+    Измеряется пустым запросом. На запросах в единицы миллисекунд эта величина
+    составляет заметную долю, и оставлять её в замере значило бы сравнивать
+    не движки, а способ их вызова.
+    """
+    import time
+
+    session.query("SELECT 1", "CSV")
+    best = float("inf")
+    for _ in range(repeat):
+        t0 = time.perf_counter()
+        session.query("SELECT 1", "CSV")
+        best = min(best, time.perf_counter() - t0)
+    return best

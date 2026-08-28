@@ -10,6 +10,10 @@
  *   %АВТОР_EN% / %АФФИЛИАЦИЯ_EN% / %ЗАГОЛОВОК_EN% — то же на английском
  *   %ПОДПИСЬ%  — подпись к таблице (курсив, без отступа)
  *   %ФОРМУЛА%  — выключная формула (по центру, курсив)
+ *
+ * В любом тексте (кроме листингов) доступны математические _{индекс} и
+ * ^{степень}: фигурные скобки обязательны, чтобы разметка не цеплялась за
+ * подчёркивания в именах вроде sales__count.
  *   %КОД%      — строка листинга моноширинным шрифтом
  *
  * Обычный markdown: ## и ### — заголовки, | … | — таблицы, **жирный**,
@@ -41,9 +45,18 @@ const SMALL = 22; // 11 pt
 const TABLE_W = 9600;
 
 /** Разбирает **жирный** и *курсив* в последовательность TextRun. */
+// Word не умеет вкладывать индекс в индекс, поэтому внутренняя разметка
+// внутри _{…} и ^{…} снимается: остаётся сам текст. Иначе фигурные скобки
+// попали бы в документ буквально.
+const flatten = (t) => t.replace(/[_^]\{/g, "").replace(/\}/g, "");
+
 function inline(text, base = {}) {
   const runs = [];
-  const re = /(\*\*[^*]+\*\*|\*[^*]+\*)/g;
+  // Порядок вариантов существен: **жирный** должен проверяться до *курсива*.
+  // _{…} и ^{…} — математические индекс и степень; фигурные скобки обязательны,
+  // иначе разметка цеплялась бы за обычные подчёркивания в именах (sales__count)
+  // и за знак ^ внутри листингов.
+  const re = /(\*\*[^*]+\*\*|\*[^*]+\*|_\{[^}]*\}|\^\{[^}]*\})/g;
   let last = 0;
   let m;
   while ((m = re.exec(text)) !== null) {
@@ -53,6 +66,14 @@ function inline(text, base = {}) {
     const token = m[0];
     if (token.startsWith("**")) {
       runs.push(new TextRun({ text: token.slice(2, -2), font: FONT, bold: true, ...base }));
+    } else if (token.startsWith("_{")) {
+      runs.push(
+        new TextRun({ text: flatten(token.slice(2, -1)), font: FONT, ...base, subScript: true })
+      );
+    } else if (token.startsWith("^{")) {
+      runs.push(
+        new TextRun({ text: flatten(token.slice(2, -1)), font: FONT, ...base, superScript: true })
+      );
     } else {
       runs.push(new TextRun({ text: token.slice(1, -1), font: FONT, italics: true, ...base }));
     }

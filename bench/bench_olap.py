@@ -127,10 +127,15 @@ def bench_b4(db: Database, sales, products, sides, repeat: int) -> None:
                           "month": [f"M{d * 12 // nd + 1}" for d in range(nd)]})
 
     if HAVE_DUCKDB:
+        # Данные переносятся в нативные таблицы: чтение зарегистрированного
+        # кадра pandas заставляло бы DuckDB преобразовывать его при каждом
+        # запросе, тогда как гиперкуб строится однократно (см. workload.py).
         con = duckdb.connect()
-        con.register("sales", sales)
-        con.register("products", products)
-        con.register("dates", dates)
+        for _name, _frame in (("sales", sales), ("products", products),
+                              ("dates", dates)):
+            con.register(f"_src_{_name}", _frame)
+            con.execute(f"CREATE TABLE {_name} AS SELECT * FROM _src_{_name}")
+            con.unregister(f"_src_{_name}")
 
         def run_oracle(sql):
             return lambda: con.execute(sql).fetchdf()
