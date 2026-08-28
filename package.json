@@ -1,0 +1,13 @@
+{
+  "name": "amdb-tools",
+  "private": true,
+  "description": "Вспомогательные инструменты: сборка статьи из markdown в .docx",
+  "scripts": {
+    "article": "node tools/md2docx.js \"docs/Статья — алгебраическая машина баз данных.md\" \"Статья Симаков — алгебраическая машина БД.docx\"",
+    "razbor": "node tools/md2docx.js \"docs/Статья — подробный разбор.md\" \"Статья Симаков — подробный разбор.docx\"",
+    "docs": "npm run article && npm run razbor"
+  },
+  "devDependencies": {
+    "docx": "^9.0.0"
+  }
+}
