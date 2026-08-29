@@ -379,3 +379,56 @@ def test_scalar_aggregate_without_group_by_on_both_layouts(layout):
     assert db.sql("SELECT COUNT(*) AS n FROM sales").rows[0][0] == pytest.approx(n)
     assert db.sql("SELECT AVG(quantity) AS a FROM sales").rows[0][0] == \
         pytest.approx(float(frame.quantity.mean()))
+
+
+def test_query_execution_uses_the_batched_gemm_path():
+    """Регрессия: исполнитель обходил ядро и терял разложение на сечения.
+
+    `Executor` вызывал einsum напрямую, поэтому оптимизация §4.6 статьи
+    применялась только при обращении к ядру и ни разу — при исполнении запроса.
+    """
+    from importlib import import_module
+
+    pd = pytest.importorskip("pandas")
+    from amdb import Database
+
+    convolve_module = import_module("amdb.core.convolve")
+    rng = np.random.default_rng(0)
+    n, side = 20_000, 60
+    sales = pd.DataFrame({"customer": rng.integers(0, side, n),
+                          "product": rng.integers(0, side, n),
+                          "date": rng.integers(0, side, n),
+                          "q": rng.random(n)})
+    price = pd.DataFrame([(p, d) for p in range(side) for d in range(side)],
+                         columns=["product", "date"])
+    price["w"] = rng.random(len(price))
+    db = Database()
+    db.load_frame(sales, ["customer", "product", "date"], "q", "sales")
+    db.load_frame(price, ["product", "date"], "w", "price")
+
+    query = ("SELECT customer, product, SUM(sales.q * price.w) AS v "
+             "FROM sales JOIN price GROUP BY customer, product")
+    assert "(1,1)-свёртка" in db.explain(query)
+
+    calls = []
+    original = convolve_module._batched_matmul
+
+    def spy(a, b, lam, mu):
+        calls.append((lam, mu))
+        return original(a, b, lam, mu)
+
+    convolve_module._batched_matmul = spy
+    try:
+        result = db.sql(query)
+    finally:
+        convolve_module._batched_matmul = original
+
+    assert calls, "исполнитель не воспользовался пакетным gemm"
+    assert all(lam >= 1 and mu >= 1 for lam, mu in calls)
+
+    reference = np.einsum("abc,bc->ab", db.cube("sales").matrix.data,
+                          db.cube("price").matrix.data)
+    got = np.zeros_like(reference)
+    for customer, product, value in result.rows:
+        got[customer, product] = value
+    assert np.allclose(got, reference)

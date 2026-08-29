@@ -17,14 +17,44 @@ from ..core.sparse import COOCube, convolve_sparse
 from ..ql.ast import Aggregate, BinOp, Column, Compare, Condition, Expr, Literal, Logical, Not, Star
 from ..ql.binder import BindError
 from ..ql.planner import ARRAY, CUBE, INDICATOR, AggPlan, EinsumStep, Operand, PhysicalPlan, ReduceStep
-from .engine import Engine, NumpyEngine
+from .engine import Engine, NumpyEngine, gpu_available, pick_engine, spec_cost
 from .result import ResultSet
 
 
 class Executor:
+    """Исполняет физический план.
+
+    Движок выбирается для каждого шага отдельно. Явно переданный движок
+    используется всегда — так работают тесты и стенды, которым нужен
+    предсказуемый путь. Если движок не задан, а ускоритель доступен, решение
+    принимает :func:`pick_engine` по оценке шага: перенос данных через шину
+    сопоставим со временем самой свёртки, поэтому включать ускоритель по одному
+    лишь объёму данных нельзя.
+    """
+
     def __init__(self, catalog: Any, engine: Engine | None = None):
         self.catalog = catalog
         self.engine = engine or NumpyEngine()
+        self._fixed_engine = engine
+        self._accelerator: Engine | None = None
+        self._engines_used: set[str] = set()
+
+    def _engine_for(self, spec: str, arrays: Sequence[np.ndarray]) -> Engine:
+        if self._fixed_engine is not None:
+            return self._fixed_engine
+        if not gpu_available():
+            return self.engine
+        chosen = pick_engine(*spec_cost(spec, *arrays))
+        if chosen.name == "numpy":
+            return self.engine
+        if self._accelerator is None:
+            self._accelerator = chosen
+        return self._accelerator
+
+    def _einsum(self, spec: str, arrays: Sequence[np.ndarray], path: Any) -> np.ndarray:
+        engine = self._engine_for(spec, arrays)
+        self._engines_used.add(engine.name)
+        return engine.einsum(spec, *arrays, path=path)
 
     # -- публичный вход -----------------------------------------------------
     def run(self, plan: PhysicalPlan) -> ResultSet:
@@ -32,6 +62,7 @@ class Executor:
         # Один и тот же счётный шаг обычно нужен и для COUNT, и для знаменателя
         # AVG, и для определения непустых групп — считаем его один раз.
         self._step_cache: dict[tuple, np.ndarray] = {}
+        self._engines_used = set()
         group_axes = plan.group_axes
         shape = tuple(len(self.catalog.dimension(a)) for a in group_axes)
 
@@ -47,7 +78,7 @@ class Executor:
         result.stats.update({
             "compute_seconds": t_compute,
             "total_seconds": time.perf_counter() - t0,
-            "engine": self.engine.name,
+            "engine": "+".join(sorted(self._engines_used)) or self.engine.name,
             "group_shape": shape,
         })
         return result
@@ -148,9 +179,8 @@ class Executor:
                 out = self._run_sparse(step, materialized)
             else:
                 arrays = [np.asarray(arr) for _, arr in materialized]
-                out = np.asarray(
-                    self.engine.einsum(step.spec, *arrays, path=step.path),
-                    dtype=np.float64)
+                out = np.asarray(self._einsum(step.spec, arrays, step.path),
+                                 dtype=np.float64)
         if key is not None:
             cache[key] = out
         return out
@@ -170,7 +200,7 @@ class Executor:
                     _, arr = self._materialize(o)
                     arrays.append(arr.to_dense().data if isinstance(arr, COOCube)
                                   else np.asarray(arr))
-            prev = self.engine.einsum(sub.spec, *arrays, path=sub.path)
+            prev = self._einsum(sub.spec, arrays, sub.path)
         return np.asarray(prev, dtype=np.float64)
 
     def _run_sparse(self, step: EinsumStep, materialized) -> np.ndarray:

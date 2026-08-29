@@ -286,3 +286,95 @@ def test_sparse_cube_supports_rank_zero_projection():
     partial = sparse.project({"b"})
     assert partial.axes == ("a", "c")
     assert np.allclose(partial.to_dense().data, dense.data.sum(axis=1))
+
+
+def test_batched_from_spec_matches_einsum_on_arbitrary_index_order():
+    """Быстрый путь должен браться из произвольной einsum-спецификации.
+
+    Ядро умеет пакетный gemm только в канонической раскладке осей, а исполнитель
+    строит спецификации с произвольным порядком индексов. Без сведения одного
+    к другому оптимизация до запросов не доходила вовсе.
+    """
+    from amdb.core.convolve import batched_from_spec
+
+    rng = np.random.default_rng(0)
+    applicable = [("abc,bcd->abd", (9, 8, 7), (8, 7, 6)),
+                  ("abc,bcd->adb", (9, 8, 7), (8, 7, 6)),
+                  ("abc,cbd->abd", (9, 8, 7), (7, 8, 6)),
+                  ("abc,bc->ab", (9, 8, 7), (8, 7)),
+                  ("abcd,bcde->abce", (6, 5, 4, 3), (5, 4, 3, 7))]
+    for spec, shape_a, shape_b in applicable:
+        A, B = rng.random(shape_a), rng.random(shape_b)
+        got = batched_from_spec(spec, A, B, min_cells=0)
+        assert got is not None, f"путь не взят для {spec}"
+        assert np.allclose(got, np.einsum(spec, A, B)), spec
+
+
+def test_batched_from_spec_declines_what_it_cannot_express():
+    """Отказ обязан быть явным: неверный ответ хуже медленного."""
+    from amdb.core.convolve import batched_from_spec
+
+    rng = np.random.default_rng(1)
+    declined = [("ab,bc->abc", (9, 8), (8, 7)),      # μ = 0, свёртки нет
+                ("ab,bc->ac", (9, 8), (8, 7)),       # λ = 0, обычное умножение
+                ("abc,bcd->ad", (9, 8, 7), (8, 7, 6)),  # λ = 0
+                ("aab,bc->ac", (5, 5, 8), (8, 7))]   # диагональ внутри операнда
+    for spec, shape_a, shape_b in declined:
+        A, B = rng.random(shape_a), rng.random(shape_b)
+        assert batched_from_spec(spec, A, B, min_cells=0) is None, spec
+
+
+def test_batched_from_spec_respects_the_size_threshold():
+    from amdb.core.convolve import BATCH_MATMUL_CELLS, batched_from_spec
+
+    rng = np.random.default_rng(2)
+    small_a, small_b = rng.random((2, 3, 4)), rng.random((3, 4, 2))
+    assert small_a.size + small_b.size < BATCH_MATMUL_CELLS
+    assert batched_from_spec("abc,bcd->abd", small_a, small_b) is None
+    assert batched_from_spec("abc,bcd->abd", small_a, small_b, min_cells=0) is not None
+
+
+def test_engine_dispatch_is_explicit_when_engine_is_given():
+    """Явно переданный движок используется всегда — на этом держатся стенды."""
+    from amdb.exec.engine import NumpyEngine
+    from amdb.exec.executor import Executor
+
+    plain = NumpyEngine(batched=False)
+    ex = Executor(catalog=None, engine=plain)
+    assert ex._engine_for("abc,bcd->abd", []) is plain
+
+
+def test_spec_cost_counts_the_whole_index_space():
+    """Оценка для pick_engine: операции по индексному пространству, байты по данным."""
+    from amdb.exec.engine import spec_cost
+
+    a = np.zeros((10, 20, 30))
+    b = np.zeros((20, 30, 40))
+    flops, moved = spec_cost("abc,bcd->abd", a, b)
+    assert flops == 10 * 20 * 30 * 40
+    expected = (a.size + b.size + 10 * 20 * 40) * a.itemsize
+    assert moved == pytest.approx(expected)
+
+
+def test_numpy_engine_batched_flag_switches_the_path():
+    from importlib import import_module
+
+    from amdb.exec.engine import NumpyEngine
+
+    conv = import_module("amdb.core.convolve")
+    rng = np.random.default_rng(3)
+    a, b = rng.random((30, 30, 20)), rng.random((30, 20, 30))
+    spec = "abc,bcd->abd"
+    reference = np.einsum(spec, a, b)
+
+    calls = []
+    original = conv._batched_matmul
+    conv._batched_matmul = lambda *args: (calls.append(1), original(*args))[1]
+    try:
+        assert np.allclose(NumpyEngine(batched=True).einsum(spec, a, b), reference)
+        assert calls, "путь должен браться при batched=True"
+        calls.clear()
+        assert np.allclose(NumpyEngine(batched=False).einsum(spec, a, b), reference)
+        assert not calls, "при batched=False путь браться не должен"
+    finally:
+        conv._batched_matmul = original

@@ -123,6 +123,13 @@ def cmd_signature(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Самопроверка окружения; базы данных не требует."""
+    from .doctor import run
+
+    return run()
+
+
 def cmd_info(args: argparse.Namespace) -> int:
     db = _open(args.db)
     print(db.summary())
@@ -222,6 +229,10 @@ def build_parser() -> argparse.ArgumentParser:
     sg = sub.add_parser("signature",
                         help="сигнатура алгебраической системы: сорта, операции, аксиомы")
     sg.set_defaults(func=cmd_signature)
+
+    d = sub.add_parser("doctor",
+                       help="самопроверка окружения: BLAS, ускоритель, точность")
+    d.set_defaults(func=cmd_doctor)
 
     i = sub.add_parser("info", help="сведения о базе и окружении")
     i.set_defaults(func=cmd_info)

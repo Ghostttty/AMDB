@@ -33,7 +33,10 @@ class Database:
         self.catalog = catalog or Catalog()
         self.engine = engine or NumpyEngine()
         self.plan_cache = PlanCache()
-        self._executor = Executor(self.catalog, self.engine)
+        # Движок передаётся исполнителю только если задан явно: иначе тот вправе
+        # выбирать его по шагу плана (см. Executor._engine_for). Передача
+        # умолчания зафиксировала бы NumPy и отключила выбор ускорителя.
+        self._executor = Executor(self.catalog, engine)
 
     # -- жизненный цикл -----------------------------------------------------
     @classmethod

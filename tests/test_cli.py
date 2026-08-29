@@ -98,3 +98,34 @@ def test_bind_error_exit_code(loaded, capsys):
 def test_missing_database(tmp_path):
     with pytest.raises(SystemExit):
         main(["--db", str(tmp_path / "нет"), "query", "SELECT SUM(q) FROM f"])
+
+
+def test_doctor_runs_without_a_database():
+    """Самопроверка должна работать на чистом клоне, до всякой загрузки данных."""
+    from amdb.api.cli import main
+
+    assert main(["doctor"]) == 0
+
+
+def test_doctor_reports_missing_optional_packages(capsys, monkeypatch):
+    """Отсутствие необязательного пакета — предупреждение с командой установки,
+    а не отказ: на арендованной машине важно узнать это за секунды."""
+    import amdb.api.doctor as doctor
+
+    real = doctor.__dict__["_check_optional"]
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
+    real()
+    out = capsys.readouterr().out
+    assert "duckdb не установлен" in out
+    assert "pip install" in out
+
+
+def test_doctor_dispatch_threshold_is_shown(capsys):
+    """Порог автовыбора должен быть виден: без него непонятно, почему на
+    небольшом кубе столбцы ускорителя пусты."""
+    from amdb.api.doctor import _check_dispatch
+
+    _check_dispatch()
+    out = capsys.readouterr().out
+    assert "Порог автовыбора движка" in out
+    assert "ускоритель" in out and "процессор" in out

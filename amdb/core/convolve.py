@@ -240,3 +240,52 @@ def convolve_naive(A: np.ndarray, B: np.ndarray, lam: int, mu: int) -> np.ndarra
                 acc += A[li + si + ci] * B[si + ci]
             out[li + si] = acc
     return out
+
+
+def batched_from_spec(spec: str, A: np.ndarray, B: np.ndarray,
+                      min_cells: int = BATCH_MATMUL_CELLS):
+    """Сводит парную einsum-спецификацию к пакетному gemm, если это возможно.
+
+    Ядро умеет исполнять (λ, μ)-произведение пакетным матричным умножением
+    (см. :func:`_batched_matmul`), но требует канонической раскладки осей.
+    Исполнитель запросов оперирует спецификациями с произвольным порядком
+    индексов, и без этой функции быстрый путь до него не доходил.
+
+    Роли индексов восстанавливаются из самой спецификации: общие и остающиеся
+    в результате — скоттовы, общие и исчезающие — кэлиевы, прочие свободны.
+    Возвращает None, если спецификация к произведению не сводится: есть
+    повторы индекса внутри операнда (диагональ), приватная свёртываемая ось
+    или индекс результата, отсутствующий в обоих операндах.
+    """
+    if "->" not in spec:
+        return None
+    lhs, out = spec.split("->")
+    parts = lhs.split(",")
+    if len(parts) != 2:
+        return None
+    sa, sb = parts
+    if len(set(sa)) != len(sa) or len(set(sb)) != len(sb) or len(set(out)) != len(out):
+        return None            # диагональ или повтор в результате
+    a_idx, b_idx, o_idx = set(sa), set(sb), set(out)
+    shared = a_idx & b_idx
+    S = [x for x in out if x in shared]
+    C = [x for x in sa if x in shared and x not in o_idx]
+    L = [x for x in out if x in a_idx and x not in b_idx]
+    M = [x for x in out if x in b_idx and x not in a_idx]
+    lam, mu = len(S), len(C)
+    if lam < 1 or mu < 1:
+        return None            # быстрый путь определён лишь при λ >= 1, μ >= 1
+    if set(L + S + C) != a_idx or set(S + C + M) != b_idx or set(L + S + M) != o_idx:
+        return None            # приватная свёртываемая ось либо лишний индекс
+    if A.size + B.size < min_cells:
+        return None            # перестановки осей дороже выигрыша
+
+    a_perm = [sa.index(x) for x in L + S + C]
+    b_perm = [sb.index(x) for x in S + C + M]
+    result = _batched_matmul(np.transpose(A, a_perm), np.transpose(B, b_perm), lam, mu)
+    if result is None:
+        return None
+    produced = L + S + M
+    if produced == list(out):
+        return result
+    return np.transpose(result, [produced.index(x) for x in out])
