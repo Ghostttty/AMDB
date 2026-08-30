@@ -12,11 +12,13 @@ from .ast import (
     Aggregate,
     Between,
     BinOp,
+    Case,
     Column,
     Compare,
     Condition,
     Expr,
     InList,
+    IsNull,
     InSubquery,
     Join,
     Literal,
@@ -80,6 +82,9 @@ class Parser:
     def parse_select(self) -> Select:
         self.expect("KEYWORD", "SELECT")
         q = Select()
+        # SELECT DISTINCT a, b — то же, что GROUP BY a, b без агрегатов:
+        # различные сочетания значений измерений и есть непустые группы.
+        distinct = bool(self.accept("KEYWORD", "DISTINCT"))
         q.items = self.parse_select_list()
         if self.accept("KEYWORD", "FROM"):
             q.source = self.parse_name()
@@ -110,6 +115,15 @@ class Parser:
             q.order_by = tuple(keys)
         if self.accept("KEYWORD", "LIMIT"):
             q.limit = int(self.expect("NUMBER").value)
+        if distinct:
+            if q.group_by:
+                raise QuerySyntaxError(
+                    "DISTINCT вместе с GROUP BY не поддержан: это одно и то же",
+                    self.text, self.cur.pos)
+            if q.aggregates():
+                raise QuerySyntaxError(
+                    "DISTINCT с агрегатом не поддержан", self.text, self.cur.pos)
+            q.group_by = tuple(str(c) for c in q.plain_columns())
         return q
 
     def parse_order_key(self) -> OrderKey:
@@ -198,9 +212,30 @@ class Parser:
             return e
         if t.kind == "KEYWORD" and t.value in AGGREGATES:
             return self.parse_aggregate()
+        if t.kind == "KEYWORD" and t.value == "CASE":
+            return self.parse_case()
         if t.kind == "NAME":
             return self.parse_column()
         raise QuerySyntaxError(f"неожиданный токен {t.value!r}", self.text, t.pos)
+
+    def parse_case(self) -> Case:
+        """CASE WHEN условие THEN выражение [WHEN ...] [ELSE выражение] END."""
+        self.expect("KEYWORD", "CASE")
+        branches: list[tuple[Condition, Expr]] = []
+        while self.at_keyword("WHEN"):
+            self.take()
+            condition = self.parse_condition()
+            self.expect("KEYWORD", "THEN")
+            branches.append((condition, self.parse_expr()))
+        if not branches:
+            raise QuerySyntaxError("в CASE нет ни одной ветви WHEN", self.text,
+                                   self.cur.pos)
+        otherwise = None
+        if self.at_keyword("ELSE"):
+            self.take()
+            otherwise = self.parse_expr()
+        self.expect("KEYWORD", "END")
+        return Case(branches, otherwise)
 
     def parse_aggregate(self) -> Aggregate:
         func = str(self.take().value)
@@ -292,6 +327,11 @@ class Parser:
             except QuerySyntaxError:
                 self.i = save
         col = self.parse_column()
+        if self.at_keyword("IS"):
+            self.take()
+            is_negated = bool(self.accept("KEYWORD", "NOT"))
+            self.expect("KEYWORD", "NULL")
+            return IsNull(col, is_negated)
         negated = bool(self.accept("KEYWORD", "NOT"))
         if self.at_keyword("IN"):
             self.take()

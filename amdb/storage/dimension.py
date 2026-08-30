@@ -14,6 +14,57 @@ import numpy as np
 from ..core.ops import rollup_matrix
 
 
+class _Null:
+    """Отсутствующее значение измерения как отдельное значение словаря.
+
+    В SQL NULL — не значение, а признак его отсутствия, и сравнения с ним дают
+    неизвестность. В многомерно-матричной модели ось обязана быть конечным
+    множеством значений, поэтому «неизвестно» вводится в словарь измерения
+    отдельным ординалом. Группировка при этом совпадает с SQL (все NULL — одна
+    группа), а индикатор любого сравнения на этом ординале равен нулю, что
+    совпадает с поведением неизвестности в WHERE. Расхождение остаётся лишь на
+    отрицании сравнения — см. §6 статьи.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "NULL"
+
+    def __reduce__(self):
+        return (_null, ())
+
+
+_NULL_SINGLETON: "_Null | None" = None
+
+
+def _null() -> _Null:
+    global _NULL_SINGLETON
+    if _NULL_SINGLETON is None:
+        _NULL_SINGLETON = _Null()
+    return _NULL_SINGLETON
+
+
+NULL = _null()
+
+
+def is_null(value: Any) -> bool:
+    """Признак отсутствующего значения: NULL, None или NaN."""
+    if value is NULL or value is None:
+        return True
+    return isinstance(value, float) and value != value
+
+
+def isna(values: np.ndarray) -> np.ndarray:
+    """Поэлементный признак отсутствия для столбца произвольного типа."""
+    arr = np.asarray(values)
+    if arr.dtype.kind == "f":
+        return np.isnan(arr)
+    if arr.dtype == object:
+        return np.fromiter((is_null(v) for v in arr), dtype=bool, count=arr.size)
+    return np.zeros(arr.shape, dtype=bool)
+
+
 class Dimension:
     """Измерение: упорядоченный словарь значений + атрибуты."""
 
@@ -25,6 +76,8 @@ class Dimension:
         self.attributes: dict[str, np.ndarray] = {}
         #: Кэш для быстрого кодирования; сбрасывается при дозагрузке.
         self._table: tuple[np.ndarray | None, np.ndarray | None] | None = None
+        #: Ординал NULL, если измерение допускает отсутствующие значения.
+        self._null_ordinal: int | None = None
         self.extend(values)
 
     # -- словарь ------------------------------------------------------------
@@ -46,6 +99,17 @@ class Dimension:
         return bool(self._values) and isinstance(self._values[0], str)
 
     @property
+    def null_ordinal(self) -> int | None:
+        """Ординал значения NULL, если оно есть в словаре."""
+        return self._null_ordinal
+
+    def ensure_null(self) -> int:
+        """Заводит в словаре ординал для отсутствующего значения."""
+        if self._null_ordinal is None:
+            self.extend([NULL])
+        return self._null_ordinal      # type: ignore[return-value]
+
+    @property
     def comparable(self) -> bool:
         """Допустимы ли диапазонные условия.
 
@@ -53,8 +117,9 @@ class Dimension:
         явного ordered=True для них — лишнее трение. Для категориальных
         измерений диапазон бессмыслен, и запрос должен упасть с внятной ошибкой.
         """
+        vals = [v for v in self._values if v is not NULL]
         return self.ordered or (
-            bool(self._values) and all(isinstance(v, (int, float)) for v in self._values)
+            bool(vals) and all(isinstance(v, (int, float)) for v in vals)
         )
 
     @staticmethod
@@ -71,9 +136,11 @@ class Dimension:
         """Добавляет новые значения в конец словаря; возвращает их ординалы."""
         added = []
         for v in values:
-            v = self._norm(v)
+            v = NULL if is_null(v) else self._norm(v)
             if v not in self._pos:
                 self._pos[v] = len(self._values)
+                if v is NULL:
+                    self._null_ordinal = len(self._values)
                 self._values.append(v)
                 added.append(self._pos[v])
         if added:
@@ -108,8 +175,18 @@ class Dimension:
         идёт медленным путём.
         """
         if self._table is None:
+            # NULL — объект, и его присутствие сделало бы массив разнородным,
+            # уронив кодирование на пословный путь. Он из таблицы исключается:
+            # отсутствующие значения кодируются отдельно, по своему ординалу.
+            if self._null_ordinal is None:
+                pairs = self._values
+                ords: np.ndarray | None = None
+            else:
+                keep = [i for i, v in enumerate(self._values) if v is not NULL]
+                pairs = [self._values[i] for i in keep]
+                ords = np.asarray(keep, dtype=np.int64)
             try:
-                arr = np.asarray(self._values)
+                arr = np.asarray(pairs)
             except Exception:  # pragma: no cover — разнородные значения
                 self._table = (None, None)
             else:
@@ -117,7 +194,8 @@ class Dimension:
                     self._table = (None, None)
                 else:
                     order = np.argsort(arr, kind="stable")
-                    self._table = (arr[order], order.astype(np.int64))
+                    base = order.astype(np.int64) if ords is None else ords[order]
+                    self._table = (arr[order], base)
         return None if self._table[0] is None else self._table
 
     def encode(self, values: Sequence[Any]) -> np.ndarray:
@@ -186,6 +264,8 @@ class Dimension:
         vals = self._values
         m = np.zeros(len(self), dtype=np.float32)
         for i, v in enumerate(vals):
+            if v is NULL:        # неизвестное значение не попадает в диапазон
+                continue
             ok = True
             if low is not None:
                 ok &= (v >= low) if inclusive[0] else (v > low)

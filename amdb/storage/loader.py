@@ -15,7 +15,7 @@ import numpy as np
 from ..core.mdm import MultidimensionalMatrix
 from ..core.sparse import COOCube
 from .catalog import Catalog, Cube
-from .dimension import Dimension, Hierarchy
+from .dimension import Dimension, Hierarchy, isna
 from .policy import DENSE, SPARSE_COO, choose_layout, estimate_bytes
 
 try:  # pragma: no cover
@@ -35,6 +35,22 @@ def _column(frame: Any, name: str) -> np.ndarray:
     if name not in frame:
         raise KeyError(f"нет столбца '{name}'; есть: {list(frame)}")
     return np.asarray(frame[name])
+
+
+def _encode(dim: "Dimension", col: np.ndarray) -> np.ndarray:
+    """Ординалы столбца; отсутствующие значения получают ординал NULL.
+
+    Кодируются они отдельно, чтобы непустая часть столбца шла быстрым путём
+    двоичного поиска: словарь с NULL разнороден по типу и на общий путь не
+    ложится.
+    """
+    missing = isna(col)
+    if not missing.any():
+        return dim.encode(col)
+    out = np.empty(len(col), dtype=np.int64)
+    out[~missing] = dim.encode(col[~missing])
+    out[missing] = dim.ensure_null()
+    return out
 
 
 def _nrows(frame: Any, cols: Sequence[str]) -> int:
@@ -69,16 +85,27 @@ def load_fact(
     ordered = set(ordered_dims)
 
     dims: list[Dimension] = []
+    columns: list[np.ndarray] = []
     for c in dim_cols:
         col = _column(frame, c)
-        uniq = np.unique(col)
+        missing = isna(col)
+        uniq = np.unique(col[~missing] if missing.any() else col)
         d = catalog.ensure_dimension(c, uniq.tolist(), ordered=c in ordered)
+        if missing.any():
+            d.ensure_null()
         dims.append(d)
+        columns.append(col)
 
     shape = tuple(len(d) for d in dims)
     values = np.asarray(_column(frame, measure_col), dtype=np.float64)
+    # NULL в мере — не значение, а его отсутствие. Нейтральный по ⊕ нуль
+    # оставляет SUM неизменной, а исключение такой строки из счётного куба
+    # даёт COUNT и AVG ровно по правилам SQL (см. §1 статьи).
+    absent = np.isnan(values)
+    if absent.any():
+        values = np.where(absent, 0.0, values)
     coords = np.stack(
-        [d.encode(_column(frame, c)) for d, c in zip(dims, dim_cols)], axis=1
+        [_encode(d, col) for d, col in zip(dims, columns)], axis=1
     ) if dim_cols else np.zeros((len(values), 0), dtype=np.int64)
 
     nnz_estimate = int(np.unique(
@@ -113,7 +140,9 @@ def load_fact(
             )
             cube = catalog.add_cube(Cube(cube_name, measure, matrix, DENSE, agg))
             if with_count:
-                counts = np.bincount(flat, minlength=cells).astype(dtype)
+                counts = np.bincount(
+                    flat, weights=None if not absent.any() else (~absent).astype(np.float64),
+                    minlength=cells).astype(dtype)
                 catalog.add_cube(Cube(
                     f"{cube_name}__count", f"{cube_name}__count",
                     MultidimensionalMatrix(counts.reshape(shape), tuple(dim_cols)),
@@ -124,7 +153,7 @@ def load_fact(
     matrix = COOCube(coords, values.astype(dtype), tuple(dim_cols), shape).coalesce()
     cube = catalog.add_cube(Cube(cube_name, measure, matrix, SPARSE_COO, agg))
     if with_count:
-        counter = COOCube(coords, np.ones(len(values), dtype=dtype),
+        counter = COOCube(coords, (~absent).astype(dtype),
                           tuple(dim_cols), shape).coalesce()
         catalog.add_cube(Cube(f"{cube_name}__count", f"{cube_name}__count",
                               counter, SPARSE_COO, "sum"))

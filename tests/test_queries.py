@@ -432,3 +432,279 @@ def test_query_execution_uses_the_batched_gemm_path():
     for customer, product, value in result.rows:
         got[customer, product] = value
     assert np.allclose(got, reference)
+
+
+def test_two_fact_queries_of_the_gpu_stand_match_duckdb():
+    """Запросы части 3 стенда B14 — новые, и сверять их больше негде.
+
+    Это произведение куба на куб: λ >= 1 при μ >= 1 либо μ = 0 с ростом ранга.
+    Именно на нём проверяется гипотеза об ускорителе, поэтому ошибка в самих
+    запросах обесценила бы весь замер.
+    """
+    duckdb = pytest.importorskip("duckdb")
+    pytest.importorskip("pandas")
+    from amdb import Database
+    from bench.bench_gpu_case import TWO_FACT_QUERIES, build_two_fact
+
+    side, rows = 12, 4_000
+    sales, price = build_two_fact(side, rows, seed=3)
+    db = Database()
+    db.load_frame(sales, ["customer", "product", "date"], "quantity", "sales")
+    db.load_frame(price, ["product", "date"], "price", "price")
+
+    con = duckdb.connect()
+    con.register("_s", sales)
+    con.register("_p", price)
+    con.execute("CREATE TABLE sales AS SELECT customer, product, date, "
+                "SUM(quantity) AS quantity FROM _s GROUP BY 1, 2, 3")
+    con.execute("CREATE TABLE price AS SELECT * FROM _p")
+
+    for label, amdb_sql, duck_sql, keys in TWO_FACT_QUERIES:
+        got = {tuple(r[:keys]): r[keys] for r in db.sql(amdb_sql).rows}
+        expected = {tuple(r[:keys]): r[keys]
+                    for r in con.execute(duck_sql).fetchall()}
+        assert set(got) == set(expected), label
+        for key, value in expected.items():
+            assert got[key] == pytest.approx(value, rel=1e-9), (label, key)
+
+
+def test_two_fact_generator_covers_the_whole_price_grid():
+    """Цены заданы на всей сетке (товар, дата) — иначе соединение теряло бы факты."""
+    pytest.importorskip("pandas")
+    from bench.bench_gpu_case import build_two_fact
+
+    side = 8
+    sales, price = build_two_fact(side, 500, seed=1)
+    assert len(price) == side * side
+    assert set(zip(price["product"], price["date"])) == {
+        (p, d) for p in range(side) for d in range(side)}
+    assert sales["customer"].max() < side
+
+
+def _case_fixture():
+    pd = pytest.importorskip("pandas")
+    from amdb import Database
+
+    rng = np.random.default_rng(0)
+    n = 20_000
+    sales = pd.DataFrame({"customer": rng.integers(0, 20, n),
+                          "product": rng.integers(0, 20, n),
+                          "date": rng.integers(0, 30, n),
+                          "quantity": rng.random(n) * 10})
+    products = pd.DataFrame({"product": range(20),
+                             "price": rng.random(20) * 100,
+                             "category": ["A" if i % 2 else "B" for i in range(20)]})
+    db = Database()
+    db.load_frame(sales, ["customer", "product", "date"], "quantity", "sales")
+    db.load_dimension(products, "product", attributes=["category"], measures=["price"])
+    return db, sales
+
+
+@pytest.mark.parametrize("amdb_sql,pandas_expr", [
+    ("SELECT customer, SUM(CASE WHEN product IN (1,2) THEN quantity ELSE 0 END) AS v "
+     "FROM sales GROUP BY customer",
+     lambda f: f.assign(t=np.where(f["product"].isin([1, 2]), f["quantity"], 0.0))),
+    ("SELECT customer, SUM(CASE WHEN date BETWEEN 5 AND 10 THEN quantity END) AS v "
+     "FROM sales GROUP BY customer",
+     lambda f: f.assign(t=np.where(f["date"].between(5, 10), f["quantity"], 0.0))),
+    ("SELECT customer, SUM(CASE WHEN product IN (1) THEN quantity "
+     "WHEN product IN (2,3) THEN quantity * 2 ELSE 0 END) AS v FROM sales GROUP BY customer",
+     lambda f: f.assign(t=np.where(f["product"] == 1, f["quantity"],
+                                   np.where(f["product"].isin([2, 3]),
+                                            f["quantity"] * 2, 0.0)))),
+    ("SELECT customer, SUM(CASE WHEN product IN (1,2) THEN 1 ELSE 0 END) AS v "
+     "FROM sales GROUP BY customer",
+     lambda f: f.assign(t=np.where(f["product"].isin([1, 2]), 1.0, 0.0))),
+])
+def test_case_when_expands_into_indicator_operands(amdb_sql, pandas_expr):
+    """Разбор случаев считается по строкам факта, как и в SQL.
+
+    Ветвление раскрывается умножением на индикатор, поэтому счёт идёт по
+    исходным строкам, а не по непустым ячейкам: за это отвечает спутниковый
+    счётный гиперкуб (см. предложение 1 статьи).
+    """
+    db, sales = _case_fixture()
+    got = dict(zip(db.sql(amdb_sql).column("customer"), db.sql(amdb_sql).column("v")))
+    expected = pandas_expr(sales).groupby("customer")["t"].sum().to_dict()
+    assert set(got) == set(expected)
+    for key, value in expected.items():
+        assert got[key] == pytest.approx(value, rel=1e-9, abs=1e-9)
+
+
+def test_case_when_puts_indicators_into_the_same_contraction():
+    """Ветвь не добавляет прохода по данным — только сомножитель."""
+    db, _ = _case_fixture()
+    plan = db.compile("SELECT customer, SUM(CASE WHEN product IN (1,2) "
+                      "THEN quantity ELSE 0 END) AS v FROM sales GROUP BY customer",
+                      use_cache=False)
+    names = [o.name for _, step in plan.aggregates[0].terms for o in step.operands]
+    assert any(n.startswith("case") for n in names), names
+
+
+def test_theta_join_matches_duckdb():
+    """Соединение по неравенству между разными измерениями."""
+    duckdb = pytest.importorskip("duckdb")
+    pd = pytest.importorskip("pandas")
+    from amdb import Database
+
+    rng = np.random.default_rng(1)
+    n = 8_000
+    sales = pd.DataFrame({"customer": rng.integers(0, 10, n),
+                          "date": rng.integers(0, 12, n),
+                          "quantity": rng.random(n) * 10})
+    budget = pd.DataFrame([(r, p) for r in range(4) for p in range(12)],
+                          columns=["region", "period"])
+    budget["plan"] = rng.random(len(budget)) * 50
+    db = Database()
+    db.load_frame(sales, ["customer", "date"], "quantity", "sales")
+    db.load_frame(budget, ["region", "period"], "plan", "budget")
+
+    con = duckdb.connect()
+    con.register("_s", sales)
+    con.register("_b", budget)
+    con.execute("CREATE TABLE sales AS SELECT customer, date, SUM(quantity) quantity "
+                "FROM _s GROUP BY 1, 2")
+    con.execute("CREATE TABLE budget AS SELECT * FROM _b")
+
+    query = ("SELECT customer, SUM(sales.quantity * budget.plan) AS v FROM sales "
+             "JOIN budget ON sales.date <= budget.period GROUP BY customer")
+    reference = ("SELECT s.customer, SUM(s.quantity * b.plan) AS v FROM sales s "
+                 "JOIN budget b ON s.date <= b.period GROUP BY 1")
+    got = {r[0]: r[1] for r in db.sql(query).rows}
+    expected = {r[0]: r[1] for r in con.execute(reference).fetchall()}
+    assert set(got) == set(expected)
+    for key, value in expected.items():
+        assert got[key] == pytest.approx(value, rel=1e-9)
+
+    spec = db.einsum_of(query)[0]
+    assert spec.count(",") == 2, f"матрица сравнения должна быть операндом: {spec}"
+
+
+def test_theta_join_rejects_dimensions_too_fine_for_a_comparison_matrix():
+    """Матрица сравнения имеет размер произведения мощностей — это надо сказать."""
+    pd = pytest.importorskip("pandas")
+    from amdb import Database
+    from amdb.ql.binder import BindError
+
+    rng = np.random.default_rng(2)
+    left = pd.DataFrame({"a": rng.integers(0, 20_000, 40_000),
+                         "x": rng.random(40_000)})
+    right = pd.DataFrame({"b": range(20_000), "y": np.random.random(20_000)})
+    db = Database()
+    db.load_frame(left, ["a"], "x", "l")
+    db.load_frame(right, ["b"], "y", "r")
+    with pytest.raises(BindError, match="слишком мелк"):
+        db.compile("SELECT SUM(l.x * r.y) AS v FROM l JOIN r ON l.a <= r.b",
+                   use_cache=False)
+
+
+def test_select_distinct_is_grouping_without_aggregates():
+    pd = pytest.importorskip("pandas")
+    from amdb import Database
+
+    rng = np.random.default_rng(3)
+    n = 5_000
+    frame = pd.DataFrame({"customer": rng.integers(0, 20, n),
+                          "product": rng.integers(0, 7, n),
+                          "q": rng.random(n)})
+    db = Database()
+    db.load_frame(frame, ["customer", "product"], "q", "sales")
+
+    assert len(db.sql("SELECT DISTINCT customer FROM sales").rows) == \
+        frame["customer"].nunique()
+    pairs = db.sql("SELECT DISTINCT customer, product FROM sales").rows
+    assert len(pairs) == len(frame[["customer", "product"]].drop_duplicates())
+    assert len(db.sql("SELECT DISTINCT product FROM sales LIMIT 3").rows) == 3
+
+
+# --- отсутствующие значения (NULL) -----------------------------------------
+def _null_frame(pd, np_):
+    """Факт с NULL и в мере, и в измерении."""
+    rng = np_.random.default_rng(11)
+    n = 5_000
+    frame = pd.DataFrame({"customer": rng.integers(0, 5, n),
+                          "product": rng.integers(0, 4, n).astype(float),
+                          "quantity": rng.random(n).round(3)})
+    frame.loc[frame.index[:900], "product"] = np_.nan
+    frame.loc[frame.index[1000:1700], "quantity"] = np_.nan
+    return frame
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT customer, SUM(quantity) AS s FROM sales GROUP BY customer",
+    "SELECT customer, COUNT(quantity) AS c FROM sales GROUP BY customer",
+    "SELECT customer, AVG(quantity) AS a FROM sales GROUP BY customer",
+    "SELECT product, SUM(quantity) AS s FROM sales GROUP BY product",
+    "SELECT SUM(quantity) AS s FROM sales WHERE product = 2",
+    "SELECT SUM(quantity) AS s FROM sales WHERE product IS NULL",
+    "SELECT SUM(quantity) AS s FROM sales WHERE product IS NOT NULL",
+    "SELECT SUM(quantity) AS s FROM sales WHERE product BETWEEN 1 AND 2",
+    "SELECT SUM(quantity) AS s FROM sales WHERE product IN (0, 1)",
+    "SELECT SUM(quantity) AS s FROM sales WHERE NOT (product = 2)",
+    "SELECT customer, SUM(CASE WHEN product = 2 THEN quantity ELSE 0 END) AS a "
+    "FROM sales GROUP BY customer",
+])
+def test_null_semantics_match_sql(sql):
+    """Отсутствующее значение ведёт себя ровно как NULL в SQL.
+
+    Мера NULL схлопывается в нейтральный по ⊕ нуль и не попадает в счётный куб,
+    поэтому SUM, COUNT и AVG совпадают с SQL. Измерение NULL получает
+    собственный ординал: группировка собирает их в одну группу, ни одно
+    сравнение на этом ординале не выполняется, а отрицание сравнения его тоже
+    не пропускает — двузначная арифметика индикаторов воспроизводит трёхзначную
+    логику WHERE.
+    """
+    pd = pytest.importorskip("pandas")
+    duckdb = pytest.importorskip("duckdb")
+    from amdb import Database
+
+    frame = _null_frame(pd, np)
+    db = Database()
+    db.load_frame(frame, ["customer", "product"], "quantity", "sales",
+                  ordered_dims=["product"])
+    con = duckdb.connect()
+    con.register("_f", frame)
+    con.execute("CREATE TABLE sales AS SELECT * FROM _f")
+
+    def key(value):
+        if value is None or (isinstance(value, float) and value != value):
+            return "NULL"
+        return "NULL" if repr(value) == "NULL" else round(float(value), 6)
+
+    got = {tuple(key(x) for x in r[:-1]): key(r[-1]) for r in db.sql(sql).rows}
+    exp = {tuple(key(x) for x in r[:-1]): key(r[-1])
+           for r in con.execute(sql).fetchall()}
+    assert got == exp
+
+
+def test_null_appears_on_incremental_load():
+    """Словарь append-only: NULL может появиться и во второй порции данных."""
+    pd = pytest.importorskip("pandas")
+    from amdb import Database
+
+    first = pd.DataFrame({"product": [0.0, 1.0, 2.0], "q": [1.0, 2.0, 3.0]})
+    both = pd.DataFrame({"product": [0.0, 1.0, 2.0, np.nan], "q": [1.0, 2.0, 3.0, 4.0]})
+    db = Database()
+    db.load_frame(first, ["product"], "q", "s", ordered_dims=["product"])
+    assert db.catalog.dimension("product").null_ordinal is None
+    db.load_frame(both, ["product"], "q", "s", ordered_dims=["product"])
+
+    dim = db.catalog.dimension("product")
+    assert dim.null_ordinal == 3, "NULL занимает следующий свободный ординал"
+    assert [repr(v) for v in dim.values] == ["0.0", "1.0", "2.0", "NULL"]
+    rows = db.sql("SELECT product, SUM(q) AS s FROM s GROUP BY product").rows
+    assert dict((repr(r[0]), r[1]) for r in rows)["NULL"] == 4.0
+
+
+def test_is_null_on_dimension_without_nulls_is_rejected():
+    pd = pytest.importorskip("pandas")
+    from amdb import Database
+
+    from amdb.ql import BindError
+
+    frame = pd.DataFrame({"product": [0, 1, 2], "q": [1.0, 2.0, 3.0]})
+    db = Database()
+    db.load_frame(frame, ["product"], "q", "s")
+    with pytest.raises(BindError, match="отсутствующих значений"):
+        db.compile("SELECT SUM(q) AS s FROM s WHERE product IS NULL",
+                   use_cache=False)

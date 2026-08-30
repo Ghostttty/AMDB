@@ -14,6 +14,7 @@ KEYWORDS = {
     "HAVING", "ORDER", "LIMIT", "AS", "AND", "OR", "NOT", "IN", "BETWEEN",
     "ASC", "DESC", "DISTINCT", "OVER", "PARTITION", "ROWS", "RANGE", "BETWEEN",
     "PRECEDING", "CURRENT", "ROW", "UNBOUNDED", "FOLLOWING", "NULL", "IS",
+    "CASE", "WHEN", "THEN", "ELSE", "END",
 }
 
 AGGREGATES = {"SUM", "AVG", "COUNT", "MIN", "MAX"}

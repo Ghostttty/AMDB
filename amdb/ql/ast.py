@@ -47,6 +47,27 @@ class Star(Expr):
 
 
 @dataclass
+class Case(Expr):
+    """CASE WHEN условие THEN выражение [...] [ELSE выражение] END.
+
+    В алгебре раскрывается через индикаторы: ветвь с условием ф даёт слагаемое
+    вида (выражение) * х, где х — индикатор ф, а последующие ветви домножаются
+    ещё и на дополнения предыдущих условий. Тем самым разбор случаев не требует
+    ни ветвления при исполнении, ни дополнительного прохода по данным — только
+    дополнительных сомножителей в том же терме.
+    """
+
+    branches: list[tuple["Condition", Expr]] = field(default_factory=list)
+    otherwise: Expr | None = None
+
+    def __str__(self) -> str:
+        parts = [f"WHEN {c} THEN {e}" for c, e in self.branches]
+        if self.otherwise is not None:
+            parts.append(f"ELSE {self.otherwise}")
+        return "CASE " + " ".join(parts) + " END"
+
+
+@dataclass
 class WindowSpec:
     partition_by: tuple[str, ...] = ()
     order_by: str | None = None
@@ -97,6 +118,14 @@ class Between(Condition):
     column: Column
     low: Any
     high: Any
+    negated: bool = False
+
+
+@dataclass
+class IsNull(Condition):
+    """IS [NOT] NULL: индикатор ординала отсутствующего значения."""
+
+    column: Column
     negated: bool = False
 
 

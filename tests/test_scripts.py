@@ -57,6 +57,8 @@ def test_demo_runs_standalone(dataset):
 @pytest.mark.parametrize("script,args", [
     ("bench/bench_convolve.py", ["--only", "b1", "--repeat", "1"]),
     ("bench/bench_gpu.py", []),
+    ("bench/bench_cardinality.py", ["--rows", "50000", "--cards", "50,200",
+                                    "--products", "10", "--months", "4"]),
 ])
 def test_bench_scripts_run_standalone(script, args):
     proc = run(script, *args)

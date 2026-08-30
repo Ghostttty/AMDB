@@ -18,11 +18,13 @@ from .ast import (
     Aggregate,
     Between,
     BinOp,
+    Case,
     Column,
     Compare,
     Condition,
     Expr,
     InList,
+    IsNull,
     InSubquery,
     Literal,
     Logical,
@@ -53,14 +55,23 @@ class MaskTensor:
 
 @dataclass
 class Term:
-    """Слагаемое нормализованного выражения: coef * произведение мер."""
+    """Слагаемое нормализованного выражения: coef * произведение мер.
+
+    ``masks`` — индикаторы, ограничивающие именно это слагаемое. Они возникают
+    из разбора случаев (CASE WHEN) и участвуют в свёртке наравне с мерами: в
+    алгебре ветвление есть умножение на индикатор, а не выбор одной из ветвей
+    при исполнении. Условие отбора всего запроса (WHERE) хранится отдельно,
+    поскольку относится ко всем слагаемым сразу.
+    """
 
     coef: float
     measures: tuple[str, ...] = ()
+    masks: tuple = ()
 
     def __repr__(self) -> str:
         body = " * ".join(self.measures) or "1"
-        return f"{self.coef:g}*{body}" if self.coef != 1 else body
+        head = f"{self.coef:g}*{body}" if self.coef != 1 else body
+        return head + ("".join(f" * [{m!r}]" for m in self.masks) if self.masks else "")
 
 
 @dataclass
@@ -93,11 +104,47 @@ class LogicalQuery:
 
 
 # --- нормализация выражений ------------------------------------------------
-def normalize(expr: Expr) -> list[Term]:
+def _null_positions(axes, catalog: Catalog) -> list[tuple[int, int]]:
+    """Позиции ординалов NULL по осям маски."""
+    out = []
+    for i, name in enumerate(axes):
+        dim = catalog.dimension(name)
+        if dim.null_ordinal is not None:
+            out.append((i, dim.null_ordinal))
+    return out
+
+
+def _negate(mask: MaskTensor, catalog: Catalog) -> MaskTensor:
+    """Отрицание условия отбора по правилам трёхзначной логики SQL.
+
+    Отрицание неизвестности остаётся неизвестностью, поэтому строка с
+    отсутствующим значением не проходит ни условие, ни его отрицание: в
+    дополнении ординал NULL обнуляется. Тем самым двузначная арифметика
+    индикаторов воспроизводит трёхзначное поведение WHERE.
+    """
+    data = 1.0 - mask.data
+    for axis, ordinal in _null_positions(mask.axes, catalog):
+        index = [slice(None)] * data.ndim
+        index[axis] = ordinal
+        data[tuple(index)] = 0.0
+    return MaskTensor(mask.axes, data)
+
+
+def _complement(mask: MaskTensor) -> MaskTensor:
+    """Индикатор отрицания условия: 1 - х."""
+    return MaskTensor(mask.axes, 1.0 - mask.data)
+
+
+def normalize(expr: Expr, catalog: Catalog | None = None) -> list[Term]:
     """Раскладывает выражение в сумму произведений мер с коэффициентами.
 
     SUM(quantity * price - discount) -> [1*quantity*price, -1*discount],
     то есть две независимые свёртки, результаты которых складываются.
+
+    Разбор случаев раскрывается по тому же правилу: ветвь с условием ф даёт
+    слагаемые, домноженные на индикатор ф, а каждая следующая ветвь — ещё и на
+    дополнения всех предыдущих условий. Каталог нужен именно для этого: без
+    него индикатор не построить.
     """
     if isinstance(expr, Literal):
         if not isinstance(expr.value, (int, float)):
@@ -109,29 +156,63 @@ def normalize(expr: Expr) -> list[Term]:
         return [Term(1.0, (expr.name,))]
     if isinstance(expr, Aggregate):
         raise BindError("вложенные агрегаты не поддерживаются")
+    if isinstance(expr, Case):
+        return _normalize_case(expr, catalog)
     if isinstance(expr, BinOp):
         if expr.op in ("+", "-"):
-            left = normalize(expr.left)
-            right = normalize(expr.right)
+            left = normalize(expr.left, catalog)
+            right = normalize(expr.right, catalog)
             sign = 1.0 if expr.op == "+" else -1.0
-            return left + [Term(t.coef * sign, t.measures) for t in right]
+            return left + [Term(t.coef * sign, t.measures, t.masks) for t in right]
         if expr.op == "*":
             out: list[Term] = []
-            for a in normalize(expr.left):
-                for b in normalize(expr.right):
-                    out.append(Term(a.coef * b.coef, a.measures + b.measures))
+            for a in normalize(expr.left, catalog):
+                for b in normalize(expr.right, catalog):
+                    out.append(Term(a.coef * b.coef, a.measures + b.measures,
+                                    a.masks + b.masks))
             return out
         if expr.op == "/":
-            denom = normalize(expr.right)
-            if len(denom) != 1 or denom[0].measures:
+            denom = normalize(expr.right, catalog)
+            if len(denom) != 1 or denom[0].measures or denom[0].masks:
                 raise BindError(
                     "деление на меру внутри агрегата не выражается через свёртку; "
                     "вычислите отношение агрегатов: SUM(a) / SUM(b)"
                 )
             if denom[0].coef == 0:
                 raise BindError("деление на ноль в выражении")
-            return [Term(t.coef / denom[0].coef, t.measures) for t in normalize(expr.left)]
+            return [Term(t.coef / denom[0].coef, t.measures, t.masks)
+                    for t in normalize(expr.left, catalog)]
     raise BindError(f"выражение {expr} не поддерживается под агрегатом")
+
+
+def _normalize_case(expr: Case, catalog: Catalog | None) -> list[Term]:
+    if catalog is None:
+        raise BindError("разбор случаев требует каталога измерений")
+    out: list[Term] = []
+    previous: list[MaskTensor] = []          # дополнения уже разобранных ветвей
+    for condition, value in expr.branches:
+        try:
+            masks = bind_condition(condition, catalog)
+        except BindError as e:
+            if "неизвестный столбец" in str(e):
+                raise BindError(
+                    f"условие ветви CASE ({condition}) должно быть задано по "
+                    "измерениям или их атрибутам. Условие на меру относилось бы "
+                    "к сумме по ячейке, а не к отдельным строкам факта, и "
+                    "разошлось бы с обычным SQL — по той же причине, по которой "
+                    "MIN и MAX считаются по ячейкам (см. условие обратимости "
+                    "отображения)"
+                ) from e
+            raise
+        indicator = _merge(masks, catalog)
+        extra = tuple(previous) + (indicator,)
+        for t in normalize(value, catalog):
+            out.append(Term(t.coef, t.measures, t.masks + extra))
+        previous.append(_complement(indicator))
+    if expr.otherwise is not None:
+        for t in normalize(expr.otherwise, catalog):
+            out.append(Term(t.coef, t.measures, t.masks + tuple(previous)))
+    return [t for t in out if t.coef != 0.0]
 
 
 # --- разрешение столбцов ---------------------------------------------------
@@ -172,7 +253,7 @@ def bind_condition(cond: Condition | None, catalog: Catalog) -> list[MaskTensor]
         return [_or(left, right)]
     if isinstance(cond, Not):
         inner = _merge(bind_condition(cond.inner, catalog), catalog)
-        return [MaskTensor(inner.axes, 1.0 - inner.data)]
+        return [_negate(inner, catalog)]
     return [_bind_predicate(cond, catalog)]
 
 
@@ -196,10 +277,7 @@ def _attribute_mask(dim: Dimension, attr: str, predicate, description: str) -> n
 def _bind_predicate(cond: Condition, catalog: Catalog) -> MaskTensor:
     if isinstance(cond, Compare):
         if isinstance(cond.value, Column):
-            # Условие соединения (ON a.x = b.x): соединение в матричной модели
-            # выполняется по совпадению осей, отдельная маска не нужна.
-            _check_join_condition(cond, catalog)
-            return MaskTensor((), np.ones((), dtype=np.float32))
+            return _bind_join_condition(cond, catalog)
         dim, attr = resolve_dimension(catalog, cond.column)
         return MaskTensor((dim.name,), _compare_mask(dim, attr, cond.op, cond.value))
     if isinstance(cond, InList):
@@ -209,7 +287,8 @@ def _bind_predicate(cond: Condition, catalog: Catalog) -> MaskTensor:
         else:
             wanted = set(cond.values)
             m = dim.attribute_mask(attr, lambda v: v in wanted)
-        return MaskTensor((dim.name,), 1.0 - m if cond.negated else m)
+        tensor = MaskTensor((dim.name,), m)
+        return _negate(tensor, catalog) if cond.negated else tensor
     if isinstance(cond, Between):
         dim, attr = resolve_dimension(catalog, cond.column)
         if attr is None:
@@ -218,23 +297,85 @@ def _bind_predicate(cond: Condition, catalog: Catalog) -> MaskTensor:
             m = _attribute_mask(
                 dim, attr, lambda v: v is not None and cond.low <= v <= cond.high,
                 f"BETWEEN {cond.low!r} AND {cond.high!r}")
+        tensor = MaskTensor((dim.name,), m)
+        return _negate(tensor, catalog) if cond.negated else tensor
+    if isinstance(cond, IsNull):
+        dim, attr = resolve_dimension(catalog, cond.column)
+        m = np.zeros(len(dim), dtype=np.float32)
+        if attr is None:
+            if dim.null_ordinal is None:
+                raise BindError(
+                    f"IS NULL по измерению '{dim.name}': отсутствующих значений "
+                    "в нём нет, условие заведомо пусто"
+                )
+            m[dim.null_ordinal] = 1.0
+        else:
+            m = dim.attribute_mask(attr, lambda v: v is None)
         return MaskTensor((dim.name,), 1.0 - m if cond.negated else m)
     if isinstance(cond, InSubquery):
         return _bind_subquery(cond, catalog)
     raise BindError(f"условие {type(cond).__name__} не поддерживается")
 
 
-def _check_join_condition(cond: Compare, catalog: Catalog) -> None:
+#: Бюджет на матрицу сравнения θ-соединения. Матрица имеет размер
+#: |левое измерение| × |правое|, поэтому на мелких измерениях она неподъёмна.
+MAX_THETA_CELLS = 1 << 26        # ~64 млн ячеек, 256 МиБ во float32
+
+_THETA_OPS = {
+    "=": np.equal, "!=": np.not_equal,
+    "<": np.less, "<=": np.less_equal,
+    ">": np.greater, ">=": np.greater_equal,
+}
+
+
+def _bind_join_condition(cond: Compare, catalog: Catalog) -> MaskTensor:
+    """Условие соединения -> операнд свёртки.
+
+    Соединение по совпадению имён осей операнда не требует: общая ось и есть
+    соединение, и оно бесплатно. Соединение же по неравенству либо по разным
+    измерениям выражается матрицей сравнения M[i, j] = [значение_i op значение_j],
+    которая входит в то же стягивание ещё одним сомножителем — так же, как
+    матрица перехода иерархии или треугольная матрица оконной функции.
+    """
     left, right = cond.column, cond.value
-    if cond.op != "=":
-        raise BindError("условие соединения должно быть равенством")
-    if left.name != right.name:
+    if left.name == right.name:
+        if cond.op == "=":
+            if left.name not in catalog.dimensions:
+                raise BindError(f"неизвестное измерение соединения '{left.name}'")
+            # Общая ось: отдельного операнда не нужно.
+            return MaskTensor((), np.ones((), dtype=np.float32))
         raise BindError(
-            f"соединение по разным измерениям ('{left.name}' и '{right.name}') "
-            "в многомерно-матричной модели не определено: оси соединяются по имени"
+            f"сравнение измерения '{left.name}' с самим собой требует его "
+            "переименованной копии, которой модель не предусматривает; "
+            "θ-соединение возможно между разными измерениями"
         )
-    if left.name not in catalog.dimensions:
-        raise BindError(f"неизвестное измерение соединения '{left.name}'")
+    for name in (left.name, right.name):
+        if name not in catalog.dimensions:
+            raise BindError(f"неизвестное измерение соединения '{name}'")
+    if cond.op not in _THETA_OPS:
+        raise BindError(f"оператор соединения '{cond.op}' не поддерживается")
+
+    a, b = catalog.dimension(left.name), catalog.dimension(right.name)
+    cells = len(a) * len(b)
+    if cells > MAX_THETA_CELLS:
+        raise BindError(
+            f"θ-соединение '{left.name}' и '{right.name}' требует матрицы "
+            f"{len(a)}×{len(b)} = {cells:,} ячеек: измерения слишком мелки. "
+            "Огрубите их или выполните соединение по равенству".replace(",", " ")
+        )
+    if cond.op not in ("=", "!=") and not (a.comparable and b.comparable):
+        raise BindError(
+            f"θ-соединение по '{cond.op}' требует упорядоченных измерений; "
+            f"'{left.name}' или '{right.name}' категориальное"
+        )
+    try:
+        matrix = _THETA_OPS[cond.op](a.values[:, None], b.values[None, :])
+    except TypeError as e:
+        raise BindError(
+            f"значения измерений '{left.name}' и '{right.name}' несравнимы "
+            f"оператором '{cond.op}'"
+        ) from e
+    return MaskTensor((a.name, b.name), np.asarray(matrix, dtype=np.float32))
 
 
 def _compare_mask(dim: Dimension, attr: str | None, op: str, value: Any) -> np.ndarray:
@@ -381,9 +522,10 @@ def bind(select: Select, catalog: Catalog) -> LogicalQuery:
                                key=f"__agg{i}")
             )
             continue
-        terms = normalize(agg.arg)
+        terms = normalize(agg.arg, catalog)
         if agg.func in ("MIN", "MAX"):
-            if len(terms) != 1 or len(terms[0].measures) != 1 or terms[0].coef != 1:
+            if (len(terms) != 1 or len(terms[0].measures) != 1
+                    or terms[0].coef != 1 or terms[0].masks):
                 raise BindError(
                     f"{agg.func} поддерживается только для одной меры без арифметики: "
                     "это редукция, а не свёртка"

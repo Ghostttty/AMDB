@@ -28,6 +28,19 @@ QUERY = (
     "GROUP BY customer, month"
 )
 
+# Конструкции, каждая из которых вносит в ту же свёртку один операнд:
+# разбор случаев — индикатор ветви, соединение по неравенству — матрицу сравнения.
+CASE_QUERY = (
+    "SELECT customer, SUM(CASE WHEN product.category = 'A' "
+    "THEN sales.quantity * product.price ELSE 0 END) AS revenue_a "
+    "FROM sales JOIN product GROUP BY customer"
+)
+THETA_QUERY = (
+    "SELECT customer, branch, SUM(sales.quantity * budget.plan) AS v "
+    "FROM sales JOIN budget ON sales.date <= budget.period "
+    "GROUP BY customer, branch"
+)
+
 
 def main() -> int:
     rng = np.random.default_rng(0)
@@ -44,11 +57,16 @@ def main() -> int:
         "price": rng.random(100) * 100,
     })
 
+    budget = pd.DataFrame(
+        [(b, p) for b in range(20) for p in range(12)], columns=["branch", "period"])
+    budget["plan"] = rng.random(len(budget)) * 1000
+
     db = Database()
     db.load_frame(sales, ["customer", "product", "date"], "quantity", "sales")
     db.load_dimension(products, "product",
                       attributes=["category"], measures=["price"])
     db.add_hierarchy("date", "month", {i: f"M{i // 10}" for i in range(120)})
+    db.load_frame(budget, ["branch", "period"], "plan", "budget")
 
     print(db.explain(QUERY))
     result = db.sql(QUERY)
@@ -56,6 +74,15 @@ def main() -> int:
     print("первые три строки:")
     for row in result.rows[:3]:
         print(f"  клиент {row[0]}, месяц {row[1]}, выручка {row[2]:.2f}")
+
+    for title, query in (("Разбор случаев", CASE_QUERY),
+                         ("Соединение по неравенству", THETA_QUERY)):
+        print()
+        print("=" * 70)
+        print(title)
+        print()
+        print(db.explain(query))
+        print(f"строк в результате: {len(db.sql(query).rows)}")
     return 0
 
 

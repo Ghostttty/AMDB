@@ -331,13 +331,41 @@ def _cube_for(catalog: Catalog, measure: str, sources: Sequence[str]) -> Cube:
 def _plan_term(term: Term, logical: LogicalQuery, catalog: Catalog,
                primary: Cube) -> EinsumStep:
     if not term.measures:
-        # SUM(константа) = константа × число строк
-        return _plan_count(None, logical, catalog, primary)
+        # SUM(константа) = константа × число строк; при разборе случаев к этому
+        # добавляются индикаторы ветви, поэтому считать надо не все строки, а
+        # попавшие под условие.
+        step = _plan_count(None, logical, catalog, primary)
+        return _with_masks(step, term, catalog)
     operands = [
         Operand(CUBE, c.name, c.axes)
         for c in (_cube_for(catalog, m, logical.sources) for m in term.measures)
     ]
-    return _assemble(operands, logical, catalog)
+    step = _assemble(operands, logical, catalog)
+    return _with_masks(step, term, catalog)
+
+
+def _with_masks(step: EinsumStep, term: Term, catalog: Catalog) -> EinsumStep:
+    """Добавляет к шагу индикаторы ветвей разбора случаев.
+
+    Ветвление в алгебре есть умножение на индикатор: слагаемое, отвечающее
+    ветви, домножается на её условие и на дополнения условий предыдущих ветвей.
+    Дополнительного прохода по данным это не требует — только дополнительных
+    сомножителей в том же стягивании.
+    """
+    if not term.masks:
+        return step
+    available = {a for o in step.operands for a in o.axes}
+    operands = list(step.operands)
+    for i, mask in enumerate(term.masks):
+        missing = [a for a in mask.axes if a not in available]
+        if missing:
+            raise BindError(
+                f"условие ветви CASE по {missing} неприменимо: измерения нет "
+                f"ни в одном операнде ({sorted(available)})"
+            )
+        operands.append(Operand(ARRAY, f"case{i}:{'/'.join(mask.axes)}",
+                                mask.axes, mask.data))
+    return EinsumStep(operands, step.output)
 
 
 def _counting_operand(cube: Cube, catalog: Catalog) -> Operand:

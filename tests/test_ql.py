@@ -137,10 +137,26 @@ def test_bind_rejects_minmax_with_arithmetic(db):
                    "JOIN product ON sales.product = product.product GROUP BY customer")
 
 
-def test_join_on_different_dimensions_is_rejected(db):
-    with pytest.raises(BindError, match="соединяются по имени"):
-        db.compile("SELECT customer, SUM(quantity) FROM sales "
-                   "JOIN product ON sales.customer = product.product GROUP BY customer")
+def test_join_on_different_dimensions_builds_a_comparison_matrix(db):
+    """Соединение разных измерений выражается матрицей сравнения.
+
+    Общая ось соединяет операнды бесплатно, но когда осей две и разных, их
+    связывает отдельный операнд M[i, j] = [значение_i op значение_j] — той же
+    природы, что матрица перехода иерархии и треугольная матрица окна.
+    """
+    plan = db.compile("SELECT customer, SUM(quantity) FROM sales "
+                      "JOIN product ON sales.customer = product.product "
+                      "GROUP BY customer", use_cache=False)
+    step = plan.aggregates[0].terms[0][1]
+    bridging = [o for o in step.operands if set(o.axes) == {"customer", "product"}]
+    assert bridging, "матрица сравнения должна войти в стягивание операндом"
+
+
+def test_theta_join_of_a_dimension_with_itself_is_rejected(db):
+    """Сравнение измерения с самим собой требует его переименованной копии."""
+    with pytest.raises(BindError, match="самим собой"):
+        db.compile("SELECT customer, SUM(quantity) FROM sales JOIN product "
+                   "ON sales.product < product.product GROUP BY customer")
 
 
 # --- планирование ----------------------------------------------------------
